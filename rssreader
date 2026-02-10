@@ -396,8 +396,11 @@ sub open_article {
     my $item = shift;
 
     if ($BROWSER_TYPE eq 'w3m') {
-        # w3m: clean exit with q, good back-button
-        system($BROWSER, '-o', 'accept_cookie=1', $item->{url});
+        # w3m: accept cookies, quit without confirmation
+        system($BROWSER,
+            '-o', 'accept_cookie=1',
+            '-o', 'confirm_qq=0',
+            $item->{url});
     }
     elsif ($BROWSER_TYPE eq 'lynx') {
         # lynx: accept cookies, quit without confirm
