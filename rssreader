@@ -25,15 +25,16 @@ for ('/usr/pkg/bin/curl', '/usr/bin/curl', '/usr/local/bin/curl', 'curl') {
     if (-x $_ || $_ eq 'curl') { $CURL = $_; last; }
 }
 
-# Interactive browser - lynx with good back-button behavior
-my $BROWSER;
-for (['/usr/pkg/bin/lynx', 'lynx'],
-     ['/usr/bin/lynx', 'lynx'],
-     ['/usr/pkg/bin/w3m', 'w3m'],
-     ['/usr/bin/w3m', 'w3m']) {
-    if (-x $_->[0]) { $BROWSER = $_->[0]; last; }
+# Interactive browser - prefer w3m (cleaner exit), then lynx
+my ($BROWSER, $BROWSER_TYPE);
+for (['/usr/pkg/bin/w3m', 'w3m'],
+     ['/usr/bin/w3m', 'w3m'],
+     ['/usr/pkg/bin/lynx', 'lynx'],
+     ['/usr/bin/lynx', 'lynx']) {
+    if (-x $_->[0]) { $BROWSER = $_->[0]; $BROWSER_TYPE = $_->[1]; last; }
 }
 $BROWSER //= 'lynx';
+$BROWSER_TYPE //= 'lynx';
 
 # State
 my (%READ_STATE, @ITEMS, @FEEDS);
@@ -392,9 +393,29 @@ sub mark_unread { delete $READ_STATE{$_[0]}; $_->{read}=0 for grep {$_->{id} eq 
 
 sub open_article {
     my $item = shift;
-    # Open URL directly in lynx - user can browse, follow links
-    # Left arrow / backspace goes back, eventually exits to RSS reader
-    system($BROWSER, $item->{url});
+
+    if ($BROWSER_TYPE eq 'w3m') {
+        # w3m: clean exit with q, good back-button
+        system($BROWSER, '-o', 'accept_cookie=1', $item->{url});
+    }
+    elsif ($BROWSER_TYPE eq 'lynx') {
+        # lynx: accept cookies, quit without confirm
+        # Create temp config for seamless experience
+        my $cfg = "$TMPDIR/rssreader_lynx_$$.cfg";
+        open my $f, '>', $cfg;
+        print $f "QUIT_DEFAULT_YES:TRUE\n";
+        print $f "ACCEPT_ALL_COOKIES:TRUE\n";
+        print $f "PERSISTENT_COOKIES:FALSE\n";
+        print $f "SET_COOKIES:TRUE\n";
+        close $f;
+
+        system($BROWSER, '-cfg=' . $cfg, '-accept_all_cookies', $item->{url});
+        unlink $cfg;
+    }
+    else {
+        system($BROWSER, $item->{url});
+    }
+
     mark_read($item->{id});
 }
 
