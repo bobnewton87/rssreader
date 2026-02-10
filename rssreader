@@ -1,0 +1,604 @@
+#!/usr/bin/env perl
+# rssreader - Pine/nano style RSS reader with folder hierarchy
+# Tags shown as folders, items inside each folder, direct article opening
+
+use strict;
+use warnings;
+use POSIX qw(strftime);
+use Digest::MD5 qw(md5_hex);
+use Fcntl qw(:flock);
+use File::Path qw(make_path);
+use Getopt::Long;
+
+$| = 1;
+
+# Config
+my $HOME = $ENV{HOME} || (getpwuid($<))[7];
+my $CONFIG_DIR = "$HOME/.rssreader";
+my $FEEDS_FILE = "$CONFIG_DIR/feeds";
+my $ITEMS_FILE = "$CONFIG_DIR/items.tsv";
+my $READ_FILE = "$CONFIG_DIR/read.tsv";
+
+# Find tools
+my $CURL;
+for ('/usr/pkg/bin/curl', '/usr/bin/curl', '/usr/local/bin/curl', 'curl') {
+    if (-x $_ || $_ eq 'curl') { $CURL = $_; last; }
+}
+
+# Interactive browser - lynx with good back-button behavior
+my $BROWSER;
+for (['/usr/pkg/bin/lynx', 'lynx'],
+     ['/usr/bin/lynx', 'lynx'],
+     ['/usr/pkg/bin/w3m', 'w3m'],
+     ['/usr/bin/w3m', 'w3m']) {
+    if (-x $_->[0]) { $BROWSER = $_->[0]; last; }
+}
+$BROWSER //= 'lynx';
+
+# State
+my (%READ_STATE, @ITEMS, @FEEDS);
+my ($ROWS, $COLS) = (24, 80);
+
+# CLI options
+my %opts = (reload=>0, print=>0, help=>0);
+GetOptions(
+    'reload|r'=>\$opts{reload},
+    'print|p'=>\$opts{print},
+    'help|h'=>\$opts{help}
+) or die "Bad args\n";
+
+if ($opts{help}) {
+    print <<'EOF';
+rssreader - Pine-style RSS reader with folders
+
+USAGE: rssreader [OPTIONS]
+
+OPTIONS:
+  -r, --reload     Fetch feeds
+  -p, --print      Print all to stdout
+  -h, --help       Help
+
+NAVIGATION:
+  Folder view (tags):
+    j/k, arrows   Navigate folders
+    Enter, l, →   Open folder
+    r             Reload feeds
+    q             Quit
+
+  Item view (inside folder):
+    j/k, arrows   Navigate items
+    Enter, l, →   Open article in browser
+    h, ←, Backsp  Back to folders
+    m             Mark read/unread
+    M             Mark all read
+    q             Quit to folders
+
+  In browser (lynx):
+    arrows        Navigate links
+    Enter         Follow link
+    ← or Backsp   Go back
+    q             Quit to RSS reader
+EOF
+    exit 0;
+}
+
+# Init
+init_config();
+load_read_state();
+load_feeds();
+load_items();
+
+fetch_all_feeds(), load_items() if $opts{reload};
+print_items(), exit if $opts{print};
+
+run_tui();
+
+#=============================================================================
+# Terminal
+#=============================================================================
+
+sub get_size {
+    my $r = `tput lines 2>/dev/null`; chomp $r;
+    my $c = `tput cols 2>/dev/null`; chomp $c;
+    unless ($r && $c) {
+        my $s = `stty size 2>/dev/null`; chomp $s;
+        ($r, $c) = split ' ', $s if $s;
+    }
+    $ROWS = $r || 24;
+    $COLS = $c || 80;
+}
+
+sub enter_alt { print "\033[?1049h\033[H"; }
+sub leave_alt { print "\033[?1049l"; }
+sub hide_cur { print "\033[?25l"; }
+sub show_cur { print "\033[?25h"; }
+sub cls { print "\033[2J\033[H"; }
+sub go { print "\033[$_[0];$_[1]H"; }
+sub rev { print "\033[7m"; }
+sub norm { print "\033[0m"; }
+sub clr_eol { print "\033[K"; }
+
+sub term_raw { system 'stty -echo -icanon min 1 time 0 2>/dev/null'; }
+sub term_cook { system 'stty echo icanon 2>/dev/null'; }
+
+sub read_key {
+    my $k = '';
+    sysread(STDIN, $k, 1);
+    if (ord($k) == 27) {
+        my $old = `stty -g 2>/dev/null`; chomp $old;
+        system 'stty -icanon min 0 time 1 2>/dev/null';
+        my $seq = '';
+        sysread(STDIN, $seq, 3);
+        system "stty '$old' 2>/dev/null" if $old;
+        return 'UP' if $seq eq '[A';
+        return 'DOWN' if $seq eq '[B';
+        return 'RIGHT' if $seq eq '[C';
+        return 'LEFT' if $seq eq '[D';
+        return 'PGUP' if $seq =~ /\[5/;
+        return 'PGDN' if $seq =~ /\[6/;
+        return 'ESC';
+    }
+    return 'ENTER' if $k eq "\n" || $k eq "\r";
+    return 'BACKSP' if ord($k) == 127 || ord($k) == 8;
+    return $k;
+}
+
+#=============================================================================
+# Files
+#=============================================================================
+
+sub init_config {
+    make_path($CONFIG_DIR) unless -d $CONFIG_DIR;
+    unless (-f $FEEDS_FILE) {
+        open my $f, '>', $FEEDS_FILE;
+        print $f <<'EOF';
+https://tldr.tech/api/rss/tech	tech
+https://tldr.tech/api/rss/ai	ai
+https://tldr.tech/api/rss/devops	devops
+https://tldr.tech/api/rss/crypto	crypto
+https://tldr.tech/api/rss/fintech	fintech
+https://tldr.tech/api/rss/webdev	dev
+EOF
+        close $f;
+    }
+    for my $file ($ITEMS_FILE, $READ_FILE) {
+        unless (-f $file) { open my $fh, '>', $file; close $fh; }
+    }
+}
+
+sub load_feeds {
+    @FEEDS = ();
+    open my $f, '<', $FEEDS_FILE or return;
+    while (<$f>) {
+        chomp; next if /^\s*#|^\s*$/;
+        my ($url, $tag) = split /\t/, $_, 2;
+
+        # Auto-derive folder name from URL if no tag provided
+        unless ($tag && $tag =~ /\S/) {
+            # Extract last path segment: .../rss/tech -> tech
+            if ($url =~ m{/([^/]+)/?$}) {
+                $tag = $1;
+            } else {
+                # Use domain as fallback
+                $tag = $url =~ m{://([^/]+)} ? $1 : 'general';
+            }
+        }
+        $tag =~ s/^\s+|\s+$//g;
+        push @FEEDS, {url => $url, tag => $tag};
+    }
+    close $f;
+}
+
+sub load_read_state {
+    %READ_STATE = ();
+    open my $f, '<', $READ_FILE or return;
+    while (<$f>) { chomp; my ($i,$t) = split /\t/; $READ_STATE{$i} = $t if $i; }
+    close $f;
+}
+
+sub save_read_state {
+    open my $f, '>', $READ_FILE or return;
+    flock($f, LOCK_EX);
+    print $f "$_\t$READ_STATE{$_}\n" for keys %READ_STATE;
+    close $f;
+}
+
+sub load_items {
+    @ITEMS = ();
+    open my $f, '<', $ITEMS_FILE or return;
+    while (<$f>) {
+        chomp;
+        my ($id,$date,$url,$title,$tag,$desc) = split /\t/, $_, 6;
+        next unless $id && $url;
+        push @ITEMS, {
+            id => $id, date => $date//'', url => $url,
+            title => $title//'(no title)', tag => $tag//'general',
+            desc => $desc//'', read => exists $READ_STATE{$id}
+        };
+    }
+    close $f;
+    @ITEMS = sort { ($b->{date}//'') cmp ($a->{date}//'') } @ITEMS;
+}
+
+sub save_items {
+    open my $f, '>', $ITEMS_FILE or return;
+    flock($f, LOCK_EX);
+    for (@ITEMS) {
+        my $d = $_->{desc}//''; $d =~ s/[\t\n\r]/ /g;
+        print $f join("\t", $_->{id}, $_->{date}, $_->{url}, $_->{title}, $_->{tag}, $d)."\n";
+    }
+    close $f;
+}
+
+#=============================================================================
+# Fetch & Parse
+#=============================================================================
+
+sub fetch_all_feeds {
+    print "Fetching feeds...\n";
+    my %seen; my @new;
+    load_items();
+    $seen{$_->{id}} = 1 for @ITEMS;
+
+    my $n = 0;
+    for my $feed (@FEEDS) {
+        $n++;
+        print "  [$n/".@FEEDS."] $feed->{tag}\n";
+        my $xml = fetch_url($feed->{url});
+        if ($xml) {
+            for my $item (parse_feed($xml, $feed->{tag})) {
+                push @new, $item unless $seen{$item->{id}}++;
+            }
+        }
+        select undef, undef, undef, 0.3 if $n < @FEEDS;
+    }
+
+    if (@new) {
+        print "Found ".@new." new items.\n";
+        push @ITEMS, @new;
+        @ITEMS = sort { ($b->{date}//'') cmp ($a->{date}//'') } @ITEMS;
+        save_items();
+    } else {
+        print "No new items.\n";
+    }
+    sleep 1;
+}
+
+sub fetch_url {
+    my $url = shift;
+    my $out = '';
+    my $pid = open my $p, '-|';
+    return undef unless defined $pid;
+    if ($pid == 0) {
+        exec($CURL, '-sfL', '--max-time', '20', '--connect-timeout', '10', $url) or exit 1;
+    }
+    { local $/; $out = <$p>; }
+    close $p;
+    return $? == 0 ? $out : undef;
+}
+
+sub parse_feed {
+    my ($xml, $tag) = @_;
+    return $xml =~ /<feed/i ? parse_atom($xml, $tag) : parse_rss($xml, $tag);
+}
+
+sub parse_rss {
+    my ($xml, $tag) = @_;
+    my @out;
+    while ($xml =~ /<item[^>]*>(.*?)<\/item>/gis) {
+        my $x = $1;
+        my $title = xtag($x,'title') // '';
+        my $link = xtag($x,'link') // '';
+        my $guid = xtag($x,'guid') // '';
+        my $date = xtag($x,'pubDate') // '';
+        my $desc = xtag($x,'description') // xtag($x,'content:encoded') // '';
+
+        $title = decode_ent($title); $title =~ s/\s+/ /g; $title =~ s/^\s+|\s+$//g;
+        $desc = decode_ent($desc);
+
+        my $id = $guid || md5_hex($link.$title);
+        push @out, {
+            id => $id, date => norm_date($date), url => $link,
+            title => $title, tag => $tag, desc => $desc, read => 0
+        } if $link;
+    }
+    return @out;
+}
+
+sub parse_atom {
+    my ($xml, $tag) = @_;
+    my @out;
+    while ($xml =~ /<entry[^>]*>(.*?)<\/entry>/gis) {
+        my $x = $1;
+        my $title = xtag($x,'title') // '';
+        my $id = xtag($x,'id') // '';
+        my $date = xtag($x,'published') // xtag($x,'updated') // '';
+        my $desc = xtag($x,'content') // xtag($x,'summary') // '';
+        my $link = $x =~ /<link[^>]*href=["']([^"']+)["']/ ? $1 : '';
+
+        $title = decode_ent($title); $title =~ s/\s+/ /g; $title =~ s/^\s+|\s+$//g;
+        $desc = decode_ent($desc);
+
+        $id ||= md5_hex($link.$title);
+        push @out, {
+            id => $id, date => norm_date($date), url => $link,
+            title => $title, tag => $tag, desc => $desc, read => 0
+        } if $link;
+    }
+    return @out;
+}
+
+sub xtag {
+    my ($x,$t) = @_;
+    return $1 // $2 if $x =~ /<$t[^>]*>(?:<!\[CDATA\[(.*?)\]\]>|([^<]*))<\/$t>/is;
+    return $1 if $x =~ /<$t[^>]*>(.*?)<\/$t>/is;
+    return undef;
+}
+
+sub decode_ent {
+    my $s = shift // return '';
+    $s =~ s/&lt;/</g; $s =~ s/&gt;/>/g; $s =~ s/&amp;/&/g;
+    $s =~ s/&quot;/"/g; $s =~ s/&apos;/'/g;
+    $s =~ s/&#(\d+);/chr($1)/ge;
+    $s =~ s/&#x([a-fA-F0-9]+);/chr(hex($1))/ge;
+    return $s;
+}
+
+sub norm_date {
+    my $d = shift // return '';
+    return "$1T$2Z" if $d =~ /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/;
+    my %m = (Jan=>'01',Feb=>'02',Mar=>'03',Apr=>'04',May=>'05',Jun=>'06',
+             Jul=>'07',Aug=>'08',Sep=>'09',Oct=>'10',Nov=>'11',Dec=>'12');
+    if ($d =~ /(\d{1,2})\s+(\w{3})\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/) {
+        return sprintf "%04d-%02d-%02dT%02d:%02d:%02dZ", $3, $m{$2}//'01', $1, $4, $5, $6;
+    }
+    return "$1-$2-$3T00:00:00Z" if $d =~ /(\d{4})-(\d{2})-(\d{2})/;
+    return strftime("%Y-%m-%dT%H:%M:%SZ", gmtime());
+}
+
+#=============================================================================
+# Helpers
+#=============================================================================
+
+sub get_folders {
+    my %folders;
+    for my $it (@ITEMS) {
+        my $tag = $it->{tag};
+        $folders{$tag}{total}++;
+        $folders{$tag}{unread}++ unless $it->{read};
+    }
+    return map { { name => $_, total => $folders{$_}{total}, unread => $folders{$_}{unread}//0 } }
+           sort keys %folders;
+}
+
+sub get_items_in_folder {
+    my $tag = shift;
+    return grep { $_->{tag} eq $tag } @ITEMS;
+}
+
+sub print_items {
+    for my $it (@ITEMS) {
+        printf "%s [%s] [%-8s] %s\n",
+            $it->{read}?' ':'*', substr($it->{date},0,10), $it->{tag}, $it->{title};
+    }
+}
+
+sub mark_read { $READ_STATE{$_[0]} = time; $_->{read}=1 for grep {$_->{id} eq $_[0]} @ITEMS; save_read_state(); }
+sub mark_unread { delete $READ_STATE{$_[0]}; $_->{read}=0 for grep {$_->{id} eq $_[0]} @ITEMS; save_read_state(); }
+
+#=============================================================================
+# Open article - DIRECT to URL in lynx (back button works naturally)
+#=============================================================================
+
+sub open_article {
+    my $item = shift;
+    # Open URL directly in lynx - user can browse, follow links
+    # Left arrow / backspace goes back, eventually exits to RSS reader
+    system($BROWSER, $item->{url});
+    mark_read($item->{id});
+}
+
+#=============================================================================
+# TUI - Two levels: Folders -> Items
+#=============================================================================
+
+sub run_tui {
+    get_size();
+    enter_alt();
+    hide_cur();
+    term_raw();
+
+    $SIG{INT} = $SIG{TERM} = sub { show_cur(); term_cook(); leave_alt(); exit 0; };
+
+    eval { folder_view(); };
+
+    show_cur();
+    term_cook();
+    leave_alt();
+}
+
+# === FOLDER VIEW ===
+sub folder_view {
+    my ($sel, $off, $msg) = (0, 0, '');
+
+    while (1) {
+        my @folders = get_folders();
+        my $tot = @folders;
+        my $lh = $ROWS - 3;
+
+        $sel = $tot - 1 if $sel >= $tot && $tot > 0;
+        $sel = 0 if $sel < 0 || $tot == 0;
+        $off = $sel if $sel < $off;
+        $off = $sel - $lh + 1 if $sel >= $off + $lh;
+        $off = 0 if $off < 0;
+
+        # Draw
+        my $scr = "\033[H";
+
+        # Header
+        my $hdr = " RSS Reader - Folders";
+        $scr .= "\033[7m" . $hdr . (' ' x ($COLS - length($hdr))) . "\033[0m\n";
+
+        if ($tot == 0) {
+            $scr .= "\n  No feeds. Press 'r' to reload.\n";
+            $scr .= "\033[K\n" x ($lh - 2);
+        } else {
+            my $end = $off + $lh - 1;
+            $end = $tot - 1 if $end >= $tot;
+
+            for my $i ($off .. $end) {
+                my $f = $folders[$i];
+                my $unread_mark = $f->{unread} > 0 ? '*' : ' ';
+                my $line = sprintf " %s %-20s  %3d items  (%d unread)",
+                    $unread_mark, $f->{name}, $f->{total}, $f->{unread};
+
+                if ($i == $sel) {
+                    $scr .= "\033[7m" . $line . (' ' x ($COLS - length($line))) . "\033[0m\n";
+                } else {
+                    $scr .= $line . "\033[K\n";
+                }
+            }
+
+            my $shown = $end - $off + 1;
+            $scr .= "\033[K\n" x ($lh - $shown);
+        }
+
+        # Status
+        if ($msg) {
+            $scr .= "\033[33m$msg\033[0m\033[K\n";
+            $msg = '';
+        } else {
+            my $total_unread = 0;
+            $total_unread += $_->{unread} for @folders;
+            $scr .= "Folder " . ($sel+1) . "/$tot | $total_unread total unread\033[K\n";
+        }
+
+        # Footer
+        $scr .= "\033[7m j/k:nav  Enter/→:open folder  r:reload  q:quit \033[0m";
+
+        print $scr;
+
+        # Input
+        my $k = read_key();
+
+        if ($k eq 'q') { last; }
+        elsif ($k eq 'j' || $k eq 'DOWN') { $sel++ if $sel < $tot-1; }
+        elsif ($k eq 'k' || $k eq 'UP') { $sel-- if $sel > 0; }
+        elsif ($k eq 'ENTER' || $k eq 'l' || $k eq 'RIGHT') {
+            if ($tot > 0) {
+                item_view($folders[$sel]->{name});
+            }
+        }
+        elsif ($k eq 'r') {
+            show_cur(); term_cook(); leave_alt();
+            fetch_all_feeds(); load_items();
+            enter_alt(); hide_cur(); term_raw();
+            $msg = "Reloaded";
+            $sel = $off = 0;
+        }
+        elsif ($k eq 'G') { $sel = $tot - 1 if $tot; }
+        elsif ($k eq 'g') { $sel = 0; }
+        elsif ($k eq ' ' || $k eq 'PGDN') { $sel += $lh; $sel = $tot-1 if $sel >= $tot; }
+        elsif ($k eq 'b' || $k eq 'PGUP') { $sel -= $lh; $sel = 0 if $sel < 0; }
+    }
+}
+
+# === ITEM VIEW (inside a folder) ===
+sub item_view {
+    my $tag = shift;
+    my ($sel, $off, $msg) = (0, 0, '');
+
+    while (1) {
+        my @items = get_items_in_folder($tag);
+        my $tot = @items;
+        my $lh = $ROWS - 3;
+
+        $sel = $tot - 1 if $sel >= $tot && $tot > 0;
+        $sel = 0 if $sel < 0 || $tot == 0;
+        $off = $sel if $sel < $off;
+        $off = $sel - $lh + 1 if $sel >= $off + $lh;
+        $off = 0 if $off < 0;
+
+        # Draw
+        my $scr = "\033[H";
+
+        # Header
+        my $hdr = " RSS Reader - $tag";
+        $scr .= "\033[7m" . $hdr . (' ' x ($COLS - length($hdr))) . "\033[0m\n";
+
+        if ($tot == 0) {
+            $scr .= "\n  No items in this folder.\n";
+            $scr .= "\033[K\n" x ($lh - 2);
+        } else {
+            my $end = $off + $lh - 1;
+            $end = $tot - 1 if $end >= $tot;
+
+            for my $i ($off .. $end) {
+                my $it = $items[$i];
+                my $mark = $it->{read} ? ' ' : '*';
+                my $dt = substr($it->{date}//'' , 0, 10);
+                my $tw = $COLS - 16;
+                my $ti = substr($it->{title}, 0, $tw);
+
+                my $line = sprintf "%s %s  %s", $mark, $dt, $ti;
+
+                if ($i == $sel) {
+                    $scr .= "\033[7m" . $line . (' ' x ($COLS - length($line))) . "\033[0m\n";
+                } else {
+                    $scr .= $line . "\033[K\n";
+                }
+            }
+
+            my $shown = $end - $off + 1;
+            $scr .= "\033[K\n" x ($lh - $shown);
+        }
+
+        # Status
+        if ($msg) {
+            $scr .= "\033[33m$msg\033[0m\033[K\n";
+            $msg = '';
+        } else {
+            my $ur = grep { !$_->{read} } @items;
+            $scr .= "Item " . ($sel+1) . "/$tot | $ur unread\033[K\n";
+        }
+
+        # Footer
+        $scr .= "\033[7m j/k:nav  Enter/→:open  ←/h:back  m:mark  M:mark all  q:back \033[0m";
+
+        print $scr;
+
+        # Input
+        my $k = read_key();
+
+        if ($k eq 'q' || $k eq 'h' || $k eq 'LEFT' || $k eq 'BACKSP') {
+            last;  # Back to folder view
+        }
+        elsif ($k eq 'j' || $k eq 'DOWN') { $sel++ if $sel < $tot-1; }
+        elsif ($k eq 'k' || $k eq 'UP') { $sel-- if $sel > 0; }
+        elsif ($k eq 'ENTER' || $k eq 'l' || $k eq 'RIGHT') {
+            if ($tot > 0) {
+                # Open article directly in browser
+                show_cur(); term_cook(); leave_alt();
+                open_article($items[$sel]);
+                enter_alt(); hide_cur(); term_raw();
+            }
+        }
+        elsif ($k eq 'm') {
+            if ($tot > 0) {
+                my $it = $items[$sel];
+                if ($it->{read}) { mark_unread($it->{id}); $msg = "Unread"; }
+                else { mark_read($it->{id}); $msg = "Read"; }
+            }
+        }
+        elsif ($k eq 'M') {
+            mark_read($_->{id}) for grep { !$_->{read} } @items;
+            $msg = "All marked read";
+        }
+        elsif ($k eq 'G') { $sel = $tot - 1 if $tot; }
+        elsif ($k eq 'g') { $sel = 0; }
+        elsif ($k eq ' ' || $k eq 'PGDN') { $sel += $lh; $sel = $tot-1 if $sel >= $tot; }
+        elsif ($k eq 'b' || $k eq 'PGUP') { $sel -= $lh; $sel = 0 if $sel < 0; }
+    }
+}
+
+__END__
