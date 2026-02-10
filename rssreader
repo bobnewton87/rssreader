@@ -18,6 +18,7 @@ my $CONFIG_DIR = "$HOME/.rssreader";
 my $FEEDS_FILE = "$CONFIG_DIR/feeds";
 my $ITEMS_FILE = "$CONFIG_DIR/items.tsv";
 my $READ_FILE = "$CONFIG_DIR/read.tsv";
+my $TMPDIR = $ENV{TMPDIR} || '/tmp';
 
 # Find tools
 my $CURL;
